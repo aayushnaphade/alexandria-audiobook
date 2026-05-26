@@ -245,10 +245,14 @@ class DatasetBuilderUpdateRowsRequest(BaseModel):
     name: str
     rows: List[dict]  # [{emotion, text, seed}]
 
+class ContextualReviewRequest(BaseModel):
+    window_size: int = 4
+
 # Global state for process tracking
 process_state = {
     "script": {"running": False, "logs": []},
     "voices": {"running": False, "logs": []},
+    "persona": {"running": False, "logs": []},
     "audio": {"running": False, "logs": [], "cancel": False},
     "audacity_export": {"running": False, "logs": []},
     "m4b_export": {"running": False, "logs": []},
@@ -581,6 +585,22 @@ async def review_script(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_process, [sys.executable, "-u", "review_script.py"], "review")
     return {"status": "started"}
 
+@app.post("/api/review_script_contextual")
+async def review_script_contextual(request: ContextualReviewRequest, background_tasks: BackgroundTasks):
+    if not os.path.exists(SCRIPT_PATH):
+        raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
+
+    if process_state["review"]["running"]:
+        raise HTTPException(status_code=400, detail="Script review already running")
+
+    window_size = max(1, min(int(request.window_size or 4), 12))
+    background_tasks.add_task(
+        run_process,
+        [sys.executable, "-u", "review_script.py", "--context-window", str(window_size)],
+        "review"
+    )
+    return {"status": "started", "mode": "contextual", "window_size": window_size}
+
 @app.get("/api/annotated_script")
 async def get_annotated_script():
     """Return the current working annotated_script.json."""
@@ -624,12 +644,28 @@ async def get_voices():
         with open(VOICE_CONFIG_PATH, "r", encoding="utf-8") as f:
             voice_config = json.load(f)
 
+    # Auto-sync newly discovered speakers: generate persona (or alias_of) on the spot.
+    # Run in background so /api/voices stays responsive.
+    missing_speakers = [name for name in voices_list if name not in voice_config]
+    if missing_speakers and not process_state["persona"]["running"]:
+        cmd = [
+            sys.executable,
+            "-u",
+            "generate_personas.py",
+            "--new-only",
+            "--alias-check",
+            "--narration-window",
+            "4"
+        ]
+        threading.Thread(target=run_process, args=(cmd, "persona"), daemon=True).start()
+
     result = []
     for voice_name in voices_list:
         config = voice_config.get(voice_name, {})
         result.append({
             "name": voice_name,
-            "config": config
+            "config": config,
+            "persona_pending": voice_name in missing_speakers
         })
     return result
 
@@ -639,6 +675,23 @@ async def parse_voices(background_tasks: BackgroundTasks):
          raise HTTPException(status_code=400, detail="Voice parsing already running")
 
     background_tasks.add_task(run_process, [sys.executable, "-u", "parse_voices.py"], "voices")
+    return {"status": "started"}
+
+
+@app.post("/api/generate_personas")
+async def generate_personas(background_tasks: BackgroundTasks):
+    """Generate LLM-derived voice persona descriptions and VoiceDesign previews.
+
+    This runs `app/generate_personas.py` which:
+    - reads `annotated_script.json`,
+    - asks the configured LLM to produce a short `description` and `ref_text` for each character,
+    - uses the VoiceDesign model to synthesize a preview and saves it,
+    - updates `voice_config.json` with a clone-style reference for each character.
+    """
+    if process_state["persona"]["running"]:
+        raise HTTPException(status_code=400, detail="Persona generation already running")
+
+    background_tasks.add_task(run_process, [sys.executable, "-u", "generate_personas.py"], "persona")
     return {"status": "started"}
 
 @app.post("/api/save_voice_config")
