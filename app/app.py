@@ -26,6 +26,7 @@ from math import ceil
 from project import ProjectManager
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT, load_default_prompts
 from review_prompts import load_review_prompts
+from persona_prompts import load_persona_prompts
 from hf_utils import fetch_builtin_manifest, download_builtin_adapter, is_adapter_downloaded
 
 # Setup logging
@@ -113,6 +114,82 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- System Helpers ---
+
+def get_gpu_stats():
+    """Get current GPU memory and utilization stats."""
+    try:
+        import torch
+    except ImportError:
+        return None
+
+    if not torch.cuda.is_available():
+        return None
+
+    stats = {}
+    try:
+        # Memory stats (works for both NVIDIA and AMD ROCm)
+        allocated = torch.cuda.memory_allocated() / 1e9  # GB
+        reserved = torch.cuda.memory_reserved() / 1e9    # GB
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9  # GB
+
+        stats['allocated_gb'] = allocated
+        stats['reserved_gb'] = reserved
+        stats['total_gb'] = total
+        stats['allocated_percent'] = (allocated / total * 100) if total > 0 else 0
+
+        # Try to get utilization via rocm-smi for AMD GPUs
+        try:
+            result = subprocess.run(
+                ['/opt/rocm/bin/rocm-smi', '--showuse', '--json'],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                for card_key, card_data in data.items():
+                    if not isinstance(card_data, dict):
+                        continue
+                    for key in ('GPU use (%)', 'GPU Use (%)', 'GPU Activity'):
+                        gpu_use_str = card_data.get(key)
+                        if gpu_use_str is not None and gpu_use_str != 'N/A':
+                            stats['utilization_percent'] = float(gpu_use_str)
+                            break
+                    break
+        except Exception:
+            stats['utilization_percent'] = None
+
+    except Exception as e:
+        logger.debug(f"Could not get GPU stats: {e}")
+        return None
+
+    return stats
+
+def check_disk_space(path, required_gb):
+    """Check if disk has enough space. Returns (has_space, free_gb)."""
+    try:
+        stat = shutil.disk_usage(path)
+        free_gb = stat.free / (1024 ** 3)
+        return free_gb >= required_gb, free_gb
+    except Exception:
+        return True, 0
+
+@app.get("/api/system/stats")
+async def get_system_stats():
+    """Return GPU and Disk statistics."""
+    gpu = get_gpu_stats()
+    # Check root dir for disk space
+    has_space, free_gb = check_disk_space(ROOT_DIR, 1.0) # 1GB threshold for generic warning
+    
+    return {
+        "gpu": gpu,
+        "disk": {
+            "free_gb": round(free_gb, 2),
+            "low_space": not has_space
+        }
+    }
+
 # Data Models
 class LLMConfig(BaseModel):
     base_url: str
@@ -151,6 +228,9 @@ class PromptConfig(BaseModel):
     user_prompt: Optional[str] = None
     review_system_prompt: Optional[str] = None
     review_user_prompt: Optional[str] = None
+    persona_system_prompt: Optional[str] = None
+    persona_user_prompt: Optional[str] = None
+    persona_advanced_prompt: Optional[str] = None
 
 class AppConfig(BaseModel):
     llm: LLMConfig
@@ -364,6 +444,13 @@ async def get_config():
             default_config["prompts"]["review_user_prompt"] = rev_usr
         except RuntimeError:
             pass
+        try:
+            per_sys, per_usr, per_adv = load_persona_prompts()
+            default_config["prompts"]["persona_system_prompt"] = per_sys
+            default_config["prompts"]["persona_user_prompt"] = per_usr
+            default_config["prompts"]["persona_advanced_prompt"] = per_adv
+        except RuntimeError:
+            pass
         config = default_config
     else:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -377,6 +464,13 @@ async def get_config():
             rev_sys, rev_usr = load_review_prompts()
             prompts["review_system_prompt"] = rev_sys
             prompts["review_user_prompt"] = rev_usr
+        except RuntimeError:
+            pass
+        try:
+            per_sys, per_usr, per_adv = load_persona_prompts()
+            prompts["persona_system_prompt"] = per_sys
+            prompts["persona_user_prompt"] = per_usr
+            prompts["persona_advanced_prompt"] = per_adv
         except RuntimeError:
             pass
         config["prompts"] = prompts
@@ -396,6 +490,17 @@ async def get_config():
                     config["prompts"]["review_user_prompt"] = rev_usr
             except RuntimeError:
                 pass  # review_prompts.txt missing or malformed — leave fields empty
+        if not config["prompts"].get("persona_system_prompt") or not config["prompts"].get("persona_user_prompt") or not config["prompts"].get("persona_advanced_prompt"):
+            try:
+                per_sys, per_usr, per_adv = load_persona_prompts()
+                if not config["prompts"].get("persona_system_prompt"):
+                    config["prompts"]["persona_system_prompt"] = per_sys
+                if not config["prompts"].get("persona_user_prompt"):
+                    config["prompts"]["persona_user_prompt"] = per_usr
+                if not config["prompts"].get("persona_advanced_prompt"):
+                    config["prompts"]["persona_advanced_prompt"] = per_adv
+            except RuntimeError:
+                pass
 
     # Include current input file info if available
     state_path = os.path.join(ROOT_DIR, "state.json")
@@ -422,6 +527,13 @@ async def get_default_prompts():
         review_sys, review_usr = load_review_prompts()
         result["review_system_prompt"] = review_sys
         result["review_user_prompt"] = review_usr
+    except RuntimeError:
+        pass
+    try:
+        persona_sys, persona_usr, persona_adv = load_persona_prompts()
+        result["persona_system_prompt"] = persona_sys
+        result["persona_user_prompt"] = persona_usr
+        result["persona_advanced_prompt"] = persona_adv
     except RuntimeError:
         pass
     return result
